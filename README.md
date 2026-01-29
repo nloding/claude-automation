@@ -12,7 +12,7 @@ This CLI tool uses the Claude Code SDK to run multiple prompts one after another
 pip install -r requirements.txt
 ```
 
-Requires `claude-code-sdk` (and Claude Code CLI installed).
+Also requires Claude Code CLI, of course.
 
 ## Usage
 
