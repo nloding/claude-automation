@@ -20,25 +20,6 @@ except ImportError:
     sys.exit(1)
 
 
-# Default error keywords to detect failures
-DEFAULT_ERROR_KEYWORDS = [
-    "error",
-    "failed",
-    "exception",
-    "cannot",
-    "unable",
-    "traceback",
-    "fatal",
-    "abort",
-]
-
-# Default warning keywords
-DEFAULT_WARNING_KEYWORDS = [
-    "warning",
-    "deprecated",
-    "caution",
-]
-
 # Default allowed tools for common development workflows
 DEFAULT_ALLOWED_TOOLS = [
     "Read",      # Read file contents
@@ -53,25 +34,19 @@ DEFAULT_ALLOWED_TOOLS = [
 async def run_prompt(
     prompt: str,
     allowed_tools: Optional[list[str]] = None,
-    error_keywords: Optional[list[str]] = None,
-    warning_keywords: Optional[list[str]] = None,
     working_dir: Optional[str] = None,
     max_turns: Optional[int] = None,
     verbose: bool = False,
-) -> tuple[bool, bool, str]:
+) -> tuple[bool, str]:
     """
-    Run a single prompt and detect success/failure/warnings.
+    Run a single prompt and detect success/failure via SDK error signals.
 
     Returns:
-        tuple of (success, has_warnings, result_text)
+        tuple of (success, result_text)
     """
     result_text = ""
     text_parts: list[str] = []  # Collect text content from messages
     had_error = False
-    had_warning = False
-
-    error_keywords = error_keywords or DEFAULT_ERROR_KEYWORDS
-    warning_keywords = warning_keywords or DEFAULT_WARNING_KEYWORDS
 
     # Use default tools if none specified
     tools_to_use = allowed_tools if allowed_tools is not None else DEFAULT_ALLOWED_TOOLS
@@ -87,8 +62,9 @@ async def run_prompt(
             prompt=prompt,
             options=ClaudeCodeOptions(**options_kwargs),
         ):
+            msg_type = type(message).__name__
             if verbose:
-                print(f"  [DEBUG] Message type: {type(message).__name__}")
+                print(f"  [DEBUG] Message type: {msg_type}")
 
             # Capture text content from assistant messages
             if hasattr(message, "content") and isinstance(message.content, str):
@@ -96,54 +72,39 @@ async def run_prompt(
                 if verbose:
                     print(f"  [DEBUG] Captured text: {message.content[:100]}...")
 
-            # Capture the final result (highest priority)
-            if hasattr(message, "result"):
-                result_text = message.result
+            # Check for ResultMessage (final message with is_error status)
+            if msg_type == "ResultMessage":
+                if hasattr(message, "result") and message.result:
+                    result_text = message.result
+                if hasattr(message, "is_error") and message.is_error:
+                    had_error = True
+                    if verbose:
+                        print(f"  [DEBUG] ResultMessage.is_error=True")
 
-            # Check for tool errors
-            if hasattr(message, "is_error") and message.is_error:
+            # Check for tool result errors (ToolResultBlock)
+            elif hasattr(message, "is_error") and message.is_error:
                 had_error = True
                 if verbose:
-                    print(f"  [DEBUG] Tool error detected")
+                    print(f"  [DEBUG] Tool error detected in {msg_type}")
 
     except Exception as e:
-        return (False, False, f"Exception: {str(e)}")
+        return (False, f"Exception: {str(e)}")
 
     # Use result_text if available, otherwise combine captured text parts
     if not result_text and text_parts:
         result_text = "\n".join(text_parts)
 
-    # Check result text for error indicators
-    result_lower = result_text.lower()
-
-    for keyword in error_keywords:
-        if keyword.lower() in result_lower:
-            had_error = True
-            if verbose:
-                print(f"  [DEBUG] Error keyword found: {keyword}")
-            break
-
-    for keyword in warning_keywords:
-        if keyword.lower() in result_lower:
-            had_warning = True
-            if verbose:
-                print(f"  [DEBUG] Warning keyword found: {keyword}")
-            break
-
-    return (not had_error, had_warning, result_text)
+    return (not had_error, result_text)
 
 
 async def run_prompts_sequential(
     prompts: list[tuple[str, str]],
     stop_on_error: bool = True,
-    stop_on_warning: bool = False,
     allowed_tools: Optional[list[str]] = None,
-    error_keywords: Optional[list[str]] = None,
-    warning_keywords: Optional[list[str]] = None,
     working_dir: Optional[str] = None,
     max_turns: Optional[int] = None,
     verbose: bool = False,
-) -> tuple[int, int, int]:
+) -> tuple[int, int]:
     """
     Run multiple prompts sequentially.
 
@@ -151,22 +112,19 @@ async def run_prompts_sequential(
         prompts: list of (name, prompt_content) tuples
 
     Returns:
-        tuple of (completed_count, error_count, warning_count)
+        tuple of (completed_count, error_count)
     """
     completed = 0
     errors = 0
-    warnings = 0
 
     for i, (name, prompt) in enumerate(prompts, 1):
         print(f"\n[{i}/{len(prompts)}] Running: {name}")
         print(f"  {prompt[:80]}{'...' if len(prompt) > 80 else ''}")
         print("-" * 60)
 
-        success, has_warning, result = await run_prompt(
+        success, result = await run_prompt(
             prompt=prompt,
             allowed_tools=allowed_tools,
-            error_keywords=error_keywords,
-            warning_keywords=warning_keywords,
             working_dir=working_dir,
             max_turns=max_turns,
             verbose=verbose,
@@ -183,18 +141,11 @@ async def run_prompts_sequential(
             if stop_on_error:
                 print("Stopping due to error (--stop-on-error is enabled).")
                 break
-        elif has_warning:
-            warnings += 1
-            completed += 1
-            print(f"\n[WARNING] {name} completed with warnings.")
-            if stop_on_warning:
-                print("Stopping due to warning (--stop-on-warning is enabled).")
-                break
         else:
             completed += 1
             print(f"\n[OK] {name} completed successfully.")
 
-    return (completed, errors, warnings)
+    return (completed, errors)
 
 
 def load_prompt_from_file(filepath: Path) -> str:
@@ -238,17 +189,14 @@ Examples:
   # Run a single prompt from a file
   python cli.py --file prompt.txt
 
-  # Stop on warnings too
-  python cli.py --dir ./prompts/ --stop-on-warning
+  # Continue even after errors
+  python cli.py --dir ./prompts/ --no-stop-on-error
 
   # Override default tools with specific set
   python cli.py --dir ./prompts/ --tools "Read,Edit,Bash"
 
   # Disable all tools (text-only mode)
   python cli.py "Explain this concept" --no-tools
-
-  # Custom error keywords
-  python cli.py "Do something" --error-keywords "error,fail,crash"
 
 Default allowed tools: Read, Write, Edit, Bash, Glob, Grep
   - Read:  Read file contents
@@ -257,6 +205,9 @@ Default allowed tools: Read, Write, Edit, Bash, Glob, Grep
   - Bash:  Run shell commands (cargo build, cargo test, npm, etc.)
   - Glob:  Find files by pattern
   - Grep:  Search file contents
+
+Error detection uses SDK structured signals (ResultMessage.is_error,
+ToolResultBlock.is_error) rather than keyword matching for reliability.
         """,
     )
 
@@ -292,13 +243,6 @@ Default allowed tools: Read, Write, Edit, Bash, Glob, Grep
     )
 
     parser.add_argument(
-        "--stop-on-warning",
-        action="store_true",
-        default=False,
-        help="Stop execution on first warning (default: False)",
-    )
-
-    parser.add_argument(
         "--tools",
         type=str,
         help=f"Comma-separated list of allowed tools (default: {','.join(DEFAULT_ALLOWED_TOOLS)})",
@@ -308,18 +252,6 @@ Default allowed tools: Read, Write, Edit, Bash, Glob, Grep
         "--no-tools",
         action="store_true",
         help="Disable all tools (text-only mode)",
-    )
-
-    parser.add_argument(
-        "--error-keywords",
-        type=str,
-        help="Comma-separated list of error keywords to detect",
-    )
-
-    parser.add_argument(
-        "--warning-keywords",
-        type=str,
-        help="Comma-separated list of warning keywords to detect",
     )
 
     parser.add_argument(
@@ -379,24 +311,18 @@ Default allowed tools: Read, Write, Edit, Bash, Glob, Grep
         allowed_tools = args.tools.split(",")
     else:
         allowed_tools = None  # Will use DEFAULT_ALLOWED_TOOLS
-    error_keywords = args.error_keywords.split(",") if args.error_keywords else None
-    warning_keywords = args.warning_keywords.split(",") if args.warning_keywords else None
 
     print(f"Running {len(prompts)} prompt(s) sequentially...")
     print(f"  Stop on error: {stop_on_error}")
-    print(f"  Stop on warning: {args.stop_on_warning}")
     tools_display = allowed_tools if allowed_tools is not None else DEFAULT_ALLOWED_TOOLS
     print(f"  Allowed tools: {tools_display}")
 
     # Run prompts
-    completed, errors, warnings = asyncio.run(
+    completed, errors = asyncio.run(
         run_prompts_sequential(
             prompts=prompts,
             stop_on_error=stop_on_error,
-            stop_on_warning=args.stop_on_warning,
             allowed_tools=allowed_tools,
-            error_keywords=error_keywords,
-            warning_keywords=warning_keywords,
             working_dir=args.working_dir,
             max_turns=args.max_turns,
             verbose=args.verbose,
@@ -410,13 +336,10 @@ Default allowed tools: Read, Write, Edit, Bash, Glob, Grep
     print(f"  Total prompts: {len(prompts)}")
     print(f"  Completed: {completed}")
     print(f"  Errors: {errors}")
-    print(f"  Warnings: {warnings}")
 
     # Exit code
     if errors > 0:
         sys.exit(1)
-    elif warnings > 0 and args.stop_on_warning:
-        sys.exit(2)
     else:
         sys.exit(0)
 
