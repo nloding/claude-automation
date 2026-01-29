@@ -15,7 +15,7 @@ from typing import Optional
 from natsort import natsorted
 
 try:
-    from claude_agent_sdk import query, ClaudeAgentOptions
+    from claude_agent_sdk import query, ClaudeAgentOptions, ProcessError
 except ImportError:
     print("Error: claude-agent-sdk not installed.")
     print("Install with: pip install claude-agent-sdk")
@@ -48,12 +48,22 @@ async def run_prompt(
     """
     result_text = ""
     text_parts: list[str] = []  # Collect text content from messages
+    stderr_output: list[str] = []  # Capture stderr for error details
     had_error = False
 
     # Use default tools if none specified
     tools_to_use = allowed_tools if allowed_tools is not None else DEFAULT_ALLOWED_TOOLS
 
-    options_kwargs = {"allowed_tools": tools_to_use}
+    # Capture stderr output via callback
+    def capture_stderr(line: str) -> None:
+        stderr_output.append(line)
+        if verbose:
+            print(f"  [STDERR] {line}")
+
+    options_kwargs = {
+        "allowed_tools": tools_to_use,
+        "stderr": capture_stderr,
+    }
     if max_turns:
         options_kwargs["max_turns"] = max_turns
     if working_dir:
@@ -89,8 +99,19 @@ async def run_prompt(
                 if verbose:
                     print(f"  [DEBUG] Tool error detected in {msg_type}")
 
+    except ProcessError as e:
+        # Extract detailed error info from ProcessError
+        error_details = e.stderr if e.stderr else "\n".join(stderr_output)
+        if not error_details:
+            error_details = str(e)
+        return (False, f"Process error (exit code {e.exit_code}):\n{error_details}")
+
     except Exception as e:
-        return (False, f"Exception: {str(e)}")
+        # Include any captured stderr in generic exceptions
+        error_msg = str(e)
+        if stderr_output:
+            error_msg += f"\n\nStderr output:\n" + "\n".join(stderr_output)
+        return (False, f"Exception: {error_msg}")
 
     # Use result_text if available, otherwise combine captured text parts
     if not result_text and text_parts:
