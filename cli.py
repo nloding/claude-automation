@@ -12,6 +12,8 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+from natsort import natsorted
+
 try:
     from claude_agent_sdk import query, ClaudeAgentOptions
 except ImportError:
@@ -163,8 +165,8 @@ def load_prompts_from_directory(dirpath: Path) -> list[tuple[str, str]]:
     """
     prompts = []
 
-    # Get all files in directory, sorted alphabetically
-    files = sorted([f for f in dirpath.iterdir() if f.is_file()])
+    # Get all files in directory, sorted naturally (so task-9 comes before task-10)
+    files = natsorted([f for f in dirpath.iterdir() if f.is_file()])
 
     for filepath in files:
         prompt_content = load_prompt_from_file(filepath)
