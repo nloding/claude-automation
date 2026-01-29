@@ -13,10 +13,10 @@ from pathlib import Path
 from typing import Optional
 
 try:
-    from claude_code_sdk import query, ClaudeCodeOptions
+    from claude_agent_sdk import query, ClaudeAgentOptions
 except ImportError:
-    print("Error: claude-code-sdk not installed.")
-    print("Install with: pip install claude-code-sdk")
+    print("Error: claude-agent-sdk not installed.")
+    print("Install with: pip install claude-agent-sdk")
     sys.exit(1)
 
 
@@ -60,7 +60,7 @@ async def run_prompt(
     try:
         async for message in query(
             prompt=prompt,
-            options=ClaudeCodeOptions(**options_kwargs),
+            options=ClaudeAgentOptions(**options_kwargs),
         ):
             msg_type = type(message).__name__
             if verbose:
