@@ -116,7 +116,7 @@ async def run_prompt(
                     print(f"  [DEBUG] Tool error detected in {msg_type}")
 
     except (ProcessError, CLIConnectionError, CLIJSONDecodeError) as e:
-        # SDK-specific errors - always fatal
+        # SDK-specific errors
         if verbose:
             print(f"  [DEBUG] SDK error type: {type(e).__name__}")
 
@@ -135,6 +135,16 @@ async def run_prompt(
             if stderr_output:
                 error_msg += f"\n\nStderr output:\n" + "\n".join(stderr_output)
 
+        # If we already saw a tool error before this exception, treat as tool error
+        if had_tool_error:
+            if verbose:
+                print(f"  [DEBUG] Exception after tool error - treating as tool error")
+            combined_result = result_text if result_text else ""
+            if combined_result:
+                combined_result += f"\n\n"
+            combined_result += f"(Exception during cleanup: {error_msg})"
+            return (False, ERROR_TYPE_TOOL, combined_result)
+
         return (False, ERROR_TYPE_SDK, f"SDK Error ({type(e).__name__}): {error_msg}")
 
     except ClaudeSDKError as e:
@@ -144,15 +154,38 @@ async def run_prompt(
         error_msg = str(e)
         if stderr_output:
             error_msg += f"\n\nStderr output:\n" + "\n".join(stderr_output)
+
+        # If we already saw a tool error before this exception, treat as tool error
+        if had_tool_error:
+            if verbose:
+                print(f"  [DEBUG] Exception after tool error - treating as tool error")
+            combined_result = result_text if result_text else ""
+            if combined_result:
+                combined_result += f"\n\n"
+            combined_result += f"(Exception during cleanup: {error_msg})"
+            return (False, ERROR_TYPE_TOOL, combined_result)
+
         return (False, ERROR_TYPE_SDK, f"SDK Error ({type(e).__name__}): {error_msg}")
 
     except Exception as e:
-        # Unknown exceptions - treat as SDK error (fatal)
+        # Unknown exceptions
         if verbose:
             print(f"  [DEBUG] Unknown exception type: {type(e).__name__}")
         error_msg = str(e)
         if stderr_output:
             error_msg += f"\n\nStderr output:\n" + "\n".join(stderr_output)
+
+        # If we already saw a tool error before this exception, treat as tool error
+        # This handles the case where SDK throws after ResultMessage.is_error=True
+        if had_tool_error:
+            if verbose:
+                print(f"  [DEBUG] Exception after tool error - treating as tool error")
+            combined_result = result_text if result_text else ""
+            if combined_result:
+                combined_result += f"\n\n"
+            combined_result += f"(Exception during cleanup: {error_msg})"
+            return (False, ERROR_TYPE_TOOL, combined_result)
+
         return (False, ERROR_TYPE_SDK, f"Exception ({type(e).__name__}): {error_msg}")
 
     # Use result_text if available, otherwise combine captured text parts
