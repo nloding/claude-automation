@@ -15,11 +15,24 @@ from typing import Optional
 from natsort import natsorted
 
 try:
-    from claude_agent_sdk import query, ClaudeAgentOptions, ProcessError
+    from claude_agent_sdk import (
+        query,
+        ClaudeAgentOptions,
+        ClaudeSDKError,
+        ProcessError,
+        CLIConnectionError,
+        CLIJSONDecodeError,
+    )
 except ImportError:
     print("Error: claude-agent-sdk not installed.")
     print("Install with: pip install claude-agent-sdk")
     sys.exit(1)
+
+
+# Error types for distinguishing SDK crashes from tool errors
+ERROR_TYPE_NONE = "none"
+ERROR_TYPE_TOOL = "tool"  # A tool Claude used returned an error (e.g., test failure)
+ERROR_TYPE_SDK = "sdk"    # SDK/process crash - always fatal
 
 
 # Default allowed tools for common development workflows
@@ -39,17 +52,20 @@ async def run_prompt(
     working_dir: Optional[str] = None,
     max_turns: Optional[int] = None,
     verbose: bool = False,
-) -> tuple[bool, str]:
+) -> tuple[bool, str, str]:
     """
     Run a single prompt and detect success/failure via SDK error signals.
 
     Returns:
-        tuple of (success, result_text)
+        tuple of (success, error_type, result_text)
+        - success: True if completed without errors
+        - error_type: ERROR_TYPE_NONE, ERROR_TYPE_TOOL, or ERROR_TYPE_SDK
+        - result_text: The result or error message
     """
     result_text = ""
     text_parts: list[str] = []  # Collect text content from messages
     stderr_output: list[str] = []  # Capture stderr for error details
-    had_error = False
+    had_tool_error = False
 
     # Use default tools if none specified
     tools_to_use = allowed_tools if allowed_tools is not None else DEFAULT_ALLOWED_TOOLS
@@ -89,63 +105,99 @@ async def run_prompt(
                 if hasattr(message, "result") and message.result:
                     result_text = message.result
                 if hasattr(message, "is_error") and message.is_error:
-                    had_error = True
+                    had_tool_error = True
                     if verbose:
-                        print(f"  [DEBUG] ResultMessage.is_error=True")
+                        print(f"  [DEBUG] ResultMessage.is_error=True (tool error, non-fatal by default)")
 
             # Check for tool result errors (ToolResultBlock)
             elif hasattr(message, "is_error") and message.is_error:
-                had_error = True
+                had_tool_error = True
                 if verbose:
                     print(f"  [DEBUG] Tool error detected in {msg_type}")
 
-    except ProcessError as e:
-        # Extract detailed error info from ProcessError
-        error_details = e.stderr if e.stderr else "\n".join(stderr_output)
-        if not error_details:
-            error_details = str(e)
-        return (False, f"Process error (exit code {e.exit_code}):\n{error_details}")
+    except (ProcessError, CLIConnectionError, CLIJSONDecodeError) as e:
+        # SDK-specific errors - always fatal
+        if verbose:
+            print(f"  [DEBUG] SDK error type: {type(e).__name__}")
 
-    except Exception as e:
-        # Include any captured stderr in generic exceptions
+        error_details = ""
+        if isinstance(e, ProcessError):
+            error_details = e.stderr if e.stderr else "\n".join(stderr_output)
+            if not error_details:
+                error_details = str(e)
+            error_msg = f"Process error (exit code {e.exit_code}):\n{error_details}"
+        elif isinstance(e, CLIJSONDecodeError):
+            error_msg = f"JSON decode error on line: {e.line}\nOriginal error: {e.original_error}"
+            if stderr_output:
+                error_msg += f"\n\nStderr output:\n" + "\n".join(stderr_output)
+        else:
+            error_msg = str(e)
+            if stderr_output:
+                error_msg += f"\n\nStderr output:\n" + "\n".join(stderr_output)
+
+        return (False, ERROR_TYPE_SDK, f"SDK Error ({type(e).__name__}): {error_msg}")
+
+    except ClaudeSDKError as e:
+        # Catch-all for other SDK errors
+        if verbose:
+            print(f"  [DEBUG] SDK error type: {type(e).__name__}")
         error_msg = str(e)
         if stderr_output:
             error_msg += f"\n\nStderr output:\n" + "\n".join(stderr_output)
-        return (False, f"Exception: {error_msg}")
+        return (False, ERROR_TYPE_SDK, f"SDK Error ({type(e).__name__}): {error_msg}")
+
+    except Exception as e:
+        # Unknown exceptions - treat as SDK error (fatal)
+        if verbose:
+            print(f"  [DEBUG] Unknown exception type: {type(e).__name__}")
+        error_msg = str(e)
+        if stderr_output:
+            error_msg += f"\n\nStderr output:\n" + "\n".join(stderr_output)
+        return (False, ERROR_TYPE_SDK, f"Exception ({type(e).__name__}): {error_msg}")
 
     # Use result_text if available, otherwise combine captured text parts
     if not result_text and text_parts:
         result_text = "\n".join(text_parts)
 
-    return (not had_error, result_text)
+    if had_tool_error:
+        # Include stderr output for tool errors if available
+        if stderr_output:
+            result_text += f"\n\nStderr output:\n" + "\n".join(stderr_output)
+        return (False, ERROR_TYPE_TOOL, result_text)
+
+    return (True, ERROR_TYPE_NONE, result_text)
 
 
 async def run_prompts_sequential(
     prompts: list[tuple[str, str]],
-    stop_on_error: bool = True,
+    stop_on_sdk_error: bool = True,
+    stop_on_tool_error: bool = False,
     allowed_tools: Optional[list[str]] = None,
     working_dir: Optional[str] = None,
     max_turns: Optional[int] = None,
     verbose: bool = False,
-) -> tuple[int, int]:
+) -> tuple[int, int, int]:
     """
     Run multiple prompts sequentially.
 
     Args:
         prompts: list of (name, prompt_content) tuples
+        stop_on_sdk_error: Stop on SDK/process errors (default: True)
+        stop_on_tool_error: Stop on tool errors like test failures (default: False)
 
     Returns:
-        tuple of (completed_count, error_count)
+        tuple of (completed_count, tool_error_count, sdk_error_count)
     """
     completed = 0
-    errors = 0
+    tool_errors = 0
+    sdk_errors = 0
 
     for i, (name, prompt) in enumerate(prompts, 1):
         print(f"\n[{i}/{len(prompts)}] Running: {name}")
         print(f"  {prompt[:80]}{'...' if len(prompt) > 80 else ''}")
         print("-" * 60)
 
-        success, result = await run_prompt(
+        success, error_type, result = await run_prompt(
             prompt=prompt,
             allowed_tools=allowed_tools,
             working_dir=working_dir,
@@ -158,17 +210,26 @@ async def run_prompts_sequential(
             result_display = result[:500] + "..." if len(result) > 500 else result
             print(f"\nResult:\n{result_display}")
 
-        if not success:
-            errors += 1
-            print(f"\n[ERROR] {name} failed.")
-            if stop_on_error:
-                print("Stopping due to error (--stop-on-error is enabled).")
+        if error_type == ERROR_TYPE_SDK:
+            sdk_errors += 1
+            print(f"\n[SDK ERROR] {name} failed due to SDK/process error.")
+            if stop_on_sdk_error:
+                print("Stopping due to SDK error (always fatal).")
                 break
+        elif error_type == ERROR_TYPE_TOOL:
+            tool_errors += 1
+            print(f"\n[TOOL ERROR] {name} completed but a tool reported an error (e.g., test failure).")
+            if stop_on_tool_error:
+                print("Stopping due to tool error (--stop-on-tool-error is enabled).")
+                break
+            else:
+                # Tool errors are non-fatal by default, count as completed
+                completed += 1
         else:
             completed += 1
             print(f"\n[OK] {name} completed successfully.")
 
-    return (completed, errors)
+    return (completed, tool_errors, sdk_errors)
 
 
 def load_prompt_from_file(filepath: Path) -> str:
@@ -212,8 +273,8 @@ Examples:
   # Run a single prompt from a file
   python cli.py --file prompt.txt
 
-  # Continue even after errors
-  python cli.py --dir ./prompts/ --no-stop-on-error
+  # Stop if a tool (like cargo test) returns an error
+  python cli.py --dir ./prompts/ --stop-on-tool-error
 
   # Override default tools with specific set
   python cli.py --dir ./prompts/ --tools "Read,Edit,Bash"
@@ -229,8 +290,10 @@ Default allowed tools: Read, Write, Edit, Bash, Glob, Grep
   - Glob:  Find files by pattern
   - Grep:  Search file contents
 
-Error detection uses SDK structured signals (ResultMessage.is_error,
-ToolResultBlock.is_error) rather than keyword matching for reliability.
+Error handling:
+  - SDK errors (connection failures, process crashes): Always stop by default
+  - Tool errors (test failures, command errors): Continue by default
+  Use --stop-on-tool-error to also stop on tool errors.
         """,
     )
 
@@ -253,16 +316,16 @@ ToolResultBlock.is_error) rather than keyword matching for reliability.
     )
 
     parser.add_argument(
-        "--stop-on-error",
+        "--stop-on-tool-error",
         action="store_true",
-        default=True,
-        help="Stop execution on first error (default: True)",
+        default=False,
+        help="Stop execution when a tool returns an error (e.g., test failure). Default: continue",
     )
 
     parser.add_argument(
-        "--no-stop-on-error",
+        "--no-stop-on-sdk-error",
         action="store_true",
-        help="Continue execution even after errors",
+        help="Continue execution even after SDK/process errors (not recommended)",
     )
 
     parser.add_argument(
@@ -327,7 +390,8 @@ ToolResultBlock.is_error) rather than keyword matching for reliability.
         sys.exit(1)
 
     # Parse options
-    stop_on_error = args.stop_on_error and not args.no_stop_on_error
+    stop_on_sdk_error = not args.no_stop_on_sdk_error
+    stop_on_tool_error = args.stop_on_tool_error
     if args.no_tools:
         allowed_tools = []
     elif args.tools:
@@ -336,15 +400,17 @@ ToolResultBlock.is_error) rather than keyword matching for reliability.
         allowed_tools = None  # Will use DEFAULT_ALLOWED_TOOLS
 
     print(f"Running {len(prompts)} prompt(s) sequentially...")
-    print(f"  Stop on error: {stop_on_error}")
+    print(f"  Stop on SDK error: {stop_on_sdk_error}")
+    print(f"  Stop on tool error: {stop_on_tool_error}")
     tools_display = allowed_tools if allowed_tools is not None else DEFAULT_ALLOWED_TOOLS
     print(f"  Allowed tools: {tools_display}")
 
     # Run prompts
-    completed, errors = asyncio.run(
+    completed, tool_errors, sdk_errors = asyncio.run(
         run_prompts_sequential(
             prompts=prompts,
-            stop_on_error=stop_on_error,
+            stop_on_sdk_error=stop_on_sdk_error,
+            stop_on_tool_error=stop_on_tool_error,
             allowed_tools=allowed_tools,
             working_dir=args.working_dir,
             max_turns=args.max_turns,
@@ -358,11 +424,14 @@ ToolResultBlock.is_error) rather than keyword matching for reliability.
     print("=" * 60)
     print(f"  Total prompts: {len(prompts)}")
     print(f"  Completed: {completed}")
-    print(f"  Errors: {errors}")
+    print(f"  Tool errors: {tool_errors}")
+    print(f"  SDK errors: {sdk_errors}")
 
-    # Exit code
-    if errors > 0:
+    # Exit code: 1 for SDK errors, 2 for tool errors only, 0 for success
+    if sdk_errors > 0:
         sys.exit(1)
+    elif tool_errors > 0:
+        sys.exit(2)
     else:
         sys.exit(0)
 
